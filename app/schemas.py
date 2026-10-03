@@ -157,6 +157,47 @@ class DeliveryAllocateIn(BaseModel):
     )
 
 
+class BypassPipeIn(BaseModel):
+    """临时旁通管：两个现有节点 + 双向共用容量（仅内存接入评估，不写入管网）。
+
+    旁通允许与现有管段并联；两端不得为同一节点，且都必须存在于当前管网。
+    """
+
+    # JSON 字段为 from/to（与管段导入一致），Python 属性名为 from_node/to_node
+    from_node: str = Field(min_length=1, validation_alias="from")
+    to_node: str = Field(min_length=1, validation_alias="to")
+    capacity: StrictInt = Field(
+        ge=0, description="旁通管双向共用容量（非负整数，升/小时）"
+    )
+
+    model_config = {"populate_by_name": True, "extra": "forbid"}
+
+
+class DeliveryBypassIn(BaseModel):
+    """临时旁通评估入参：已读版本 + 旁通管 + 覆盖全网的水源/管段容量
+    + 带保障等级的用水需求。
+
+    水源与管段编号须完整覆盖当前管网（不多不少、同类不重复），
+    用水点编号须存在且为 sink、同批不重复、需求列表非空、等级为正整数
+    （与 /api/delivery/allocate 完全一致）；旁通端点须为两个不同的现有节点。
+    """
+
+    version: StrictInt = Field(ge=0, description="读取管网时的版本号，空网为 0")
+    bypass: BypassPipeIn = Field(
+        description="临时旁通管（from/to 为两个现有节点，capacity 为双向共用容量）"
+    )
+    sources: list[DeliverySourceIn] = Field(
+        description="每个水源的供水上限（须覆盖当前管网全部水源；空网为空列表）"
+    )
+    pipes: list[DeliveryPipeIn] = Field(
+        description="每条管段的双向共用输水上限（须覆盖全部管段；空网为空列表）"
+    )
+    demands: list[DeliveryAllocationDemandIn] = Field(
+        description="非空用水点需求列表（sink_id/demand/level）；"
+        "未列需求的用水点按零需求、不参与分配"
+    )
+
+
 # ---------------------------------------------------------------- 响应模型
 
 
@@ -342,6 +383,65 @@ class DeliveryAllocateOut(BaseModel):
     all_satisfied: bool
     levels: list[LevelDeliveryOut]
     deliveries: list[SinkDeliveryOut]
+
+
+class BypassPipeOut(BaseModel):
+    """旁通管回显（from/to 为评估输入的两个端点，capacity 为双向共用容量）。"""
+
+    from_: str = Field(serialization_alias="from")
+    to_: str = Field(serialization_alias="to")
+    capacity: int
+
+
+class BypassAllocationOut(BaseModel):
+    """某一状态（基线 / 接入旁通后）的保障等级分档交付结果。"""
+
+    total_demand: int
+    total_delivered: int
+    all_satisfied: bool
+    levels: list[LevelDeliveryOut]
+    deliveries: list[SinkDeliveryOut]
+
+
+class BypassLevelDeltaOut(BaseModel):
+    """单个保障等级接入旁通后的交付差值（旁通后 - 基线）。"""
+
+    level: int
+    delivered_delta: int
+
+
+class BypassSinkDeltaOut(BaseModel):
+    """单个用水点接入旁通后的交付差值（旁通后 - 基线）。"""
+
+    sink_id: str
+    level: int
+    delivered_delta: int
+
+
+class BypassDeltaOut(BaseModel):
+    """接入旁通后相对基线的交付差值（旁通后 - 基线），按等级与用水点给出。"""
+
+    total_delivered_delta: int
+    levels: list[BypassLevelDeltaOut]
+    deliveries: list[BypassSinkDeltaOut]
+
+
+class DeliveryBypassOut(BaseModel):
+    """临时旁通评估只读结果。
+
+    usable=false（接入后某条待修复故障管段任一端重新进水）时不输出旁通
+    交付量：with_bypass 与 delta 均为 null，危险明细见 block_reasons；
+    版本过期不拒绝，仍按当前状态核算，仅 version_match=false。
+    """
+
+    version: int
+    version_match: bool
+    bypass: BypassPipeOut
+    usable: bool
+    block_reasons: list[ReopenBlockOut]
+    baseline: BypassAllocationOut
+    with_bypass: BypassAllocationOut | None
+    delta: BypassDeltaOut | None
 
 
 class ReconcileSourceIn(BaseModel):

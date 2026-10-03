@@ -14,6 +14,7 @@ from app.planning import (  # noqa: E402
     DrillStep,
     diff_states,
     allocate_delivery,
+    evaluate_bypass,
     evaluate_delivery,
     evaluate_plan,
     evaluate_restore,
@@ -22,6 +23,7 @@ from app.planning import (  # noqa: E402
     reachable_sink_ids,
     recommend_plan,
     simulate_drill,
+    validate_bypass_request,
     validate_delivery_request,
     validate_reconcile_request,
     reconcile_meters,
@@ -62,6 +64,8 @@ from app.planning import (  # noqa: E402
     DELIVERY_SINK_NOT_SINK,
     DELIVERY_SINK_DUPLICATE,
     DELIVERY_DEMANDS_EMPTY,
+    BYPASS_ENDPOINT_NOT_FOUND,
+    BYPASS_ENDPOINT_SAME,
 )
 
 
@@ -1207,6 +1211,276 @@ class DeliveryAllocationTests(unittest.TestCase):
             [(e.sink_id, e.level) for e in result.entries],
             [("U1", 1), ("U2", 2)],
         )
+
+
+# ---------------------------------------------------------------- 临时旁通评估
+
+
+def build_bypass_zone_demo():
+    """故障隔离区外可安全接入旁通的管网：
+
+    S --P1[阀]-- A --P2[阀]-- B --P4[阀,已关]-- D --P6(无阀,待修复)-- U3
+                   |           |              |
+                 P3[阀]       P5[阀]         P7[阀,已关]
+                   |           |              |
+                  U1          U2             E --P8[阀]-- U4
+
+    待修复故障 P6（D—U3）；P4、P7 已关闭：D/U3 与 E/U4 各自成区，
+    E/U4 区与故障端点 D/U3 被已关阀门 P7 隔开。
+    """
+    nodes = {
+        "S": Node("S", "source"),
+        "A": Node("A", "junction"),
+        "B": Node("B", "junction"),
+        "D": Node("D", "junction"),
+        "E": Node("E", "junction"),
+        "U1": Node("U1", "sink"),
+        "U2": Node("U2", "sink"),
+        "U3": Node("U3", "sink"),
+        "U4": Node("U4", "sink"),
+    }
+    pipes = {
+        "P1": Pipe("P1", "S", "A", has_valve=True),
+        "P2": Pipe("P2", "A", "B", has_valve=True),
+        "P3": Pipe("P3", "A", "U1", has_valve=True),
+        "P4": Pipe("P4", "B", "D", has_valve=True, valve_closed=True),
+        "P5": Pipe("P5", "B", "U2", has_valve=True),
+        "P6": Pipe("P6", "D", "U3", has_valve=False),
+        "P7": Pipe("P7", "D", "E", has_valve=True, valve_closed=True),
+        "P8": Pipe("P8", "E", "U4", has_valve=True),
+    }
+    return nodes, pipes
+
+
+class BypassEvaluationTests(unittest.TestCase):
+    def _zone_args(self):
+        nodes, pipes = build_bypass_zone_demo()
+        source_caps = [("S", 100)]
+        pipe_caps = [(pid, 100) for pid in pipes]
+        demands = [("U1", 10, 1), ("U2", 10, 1), ("U3", 10, 2), ("U4", 10, 2)]
+        blocked = frozenset({"P4", "P6", "P7"})
+        pending = frozenset({"P6"})
+        return nodes, pipes, source_caps, pipe_caps, demands, blocked, pending
+
+    def test_safe_bypass_restores_sink_outside_fault_endpoints(self):
+        nodes, pipes, source_caps, pipe_caps, demands, blocked, pending = (
+            self._zone_args()
+        )
+        # 旁通 B—U4：E/U4 区与故障端点被已关阀门 P7 隔开，安全
+        result = evaluate_bypass(
+            nodes, pipes, "B", "U4", 50, source_caps, pipe_caps, demands,
+            blocked_pipe_ids=blocked, pending_fault_pipe_ids=pending,
+        )
+        self.assertTrue(result.usable)
+        self.assertEqual(result.blocks, [])
+        # 基线：U3/U4 在隔离区内断供
+        self.assertEqual(
+            [(e.sink_id, e.delivered) for e in result.baseline.entries],
+            [("U1", 10), ("U2", 10), ("U3", 0), ("U4", 0)],
+        )
+        self.assertEqual(result.baseline.total_delivered, 20)
+        # 旁通后：U4 恢复供水，U3 仍因故障管段 P6 阻断为 0
+        self.assertEqual(
+            [(e.sink_id, e.delivered) for e in result.bypass.entries],
+            [("U1", 10), ("U2", 10), ("U3", 0), ("U4", 10)],
+        )
+        self.assertEqual(result.bypass.total_delivered, 30)
+
+    def test_bypass_reaching_fault_endpoint_is_unusable(self):
+        nodes, pipes, source_caps, pipe_caps, demands, blocked, pending = (
+            self._zone_args()
+        )
+        # 旁通接到故障管段端点 D：D 重新进水 -> 判为不可用，不输出旁通交付量
+        result = evaluate_bypass(
+            nodes, pipes, "B", "D", 50, source_caps, pipe_caps, demands,
+            blocked_pipe_ids=blocked, pending_fault_pipe_ids=pending,
+        )
+        self.assertFalse(result.usable)
+        self.assertIsNone(result.bypass)
+        self.assertEqual(
+            [(b.fault_pipe_id, b.reachable_endpoints) for b in result.blocks],
+            [("P6", ["D"])],
+        )
+        # 危险明细带与复供/水源切换一致的 FAULT_REWATER_RISK 代码
+        block_dict = result.blocks[0].as_dict()
+        self.assertEqual(block_dict["code"], FAULT_REWATER_RISK)
+        self.assertEqual(block_dict["pipe_id"], "P6")
+        self.assertEqual(block_dict["reachable_endpoints"], ["D"])
+        # 基线仍然给出
+        self.assertEqual(result.baseline.total_delivered, 20)
+
+    def test_bypass_to_other_fault_endpoint_is_unusable(self):
+        nodes, pipes, source_caps, pipe_caps, demands, blocked, pending = (
+            self._zone_args()
+        )
+        # 旁通接到故障管段另一端 U3
+        result = evaluate_bypass(
+            nodes, pipes, "B", "U3", 50, source_caps, pipe_caps, demands,
+            blocked_pipe_ids=blocked, pending_fault_pipe_ids=pending,
+        )
+        self.assertFalse(result.usable)
+        self.assertEqual(
+            [(b.fault_pipe_id, b.reachable_endpoints) for b in result.blocks],
+            [("P6", ["U3"])],
+        )
+
+    def test_bypass_parallel_to_fault_pipe_stays_sourceless_and_safe(self):
+        nodes, pipes, source_caps, pipe_caps, demands, blocked, pending = (
+            self._zone_args()
+        )
+        # 旁通与故障管段 P6 并联（D—U3）：该连通块没有运行水源，安全但无提升
+        result = evaluate_bypass(
+            nodes, pipes, "D", "U3", 50, source_caps, pipe_caps, demands,
+            blocked_pipe_ids=blocked, pending_fault_pipe_ids=pending,
+        )
+        self.assertTrue(result.usable)
+        self.assertEqual(
+            [(e.sink_id, e.delivered) for e in result.bypass.entries],
+            [("U1", 10), ("U2", 10), ("U3", 0), ("U4", 0)],
+        )
+
+    def test_bypass_into_valve_separated_zone_is_safe(self):
+        nodes, pipes, source_caps, pipe_caps, demands, blocked, pending = (
+            self._zone_args()
+        )
+        # 旁通接到 E：E 经 P8 带 U4 恢复，但 P7 已关，故障端点 D/U3 仍不可达
+        result = evaluate_bypass(
+            nodes, pipes, "B", "E", 50, source_caps, pipe_caps, demands,
+            blocked_pipe_ids=blocked, pending_fault_pipe_ids=pending,
+        )
+        self.assertTrue(result.usable)
+        delivered = {e.sink_id: e.delivered for e in result.bypass.entries}
+        self.assertEqual(delivered["U4"], 10)
+        self.assertEqual(delivered["U3"], 0)
+
+    def test_parallel_bypass_boosts_capacity_without_faults(self):
+        # 无待修复故障：旁通 S—A 与 P1（容量 6）并联，等级 1 的 U1 先拿满
+        nodes, pipes = build_allocation_demo()
+        result = evaluate_bypass(
+            nodes, pipes, "S", "A", 4,
+            [("S", 100)],
+            [("P1", 6), ("P2", 100), ("P3", 100)],
+            [("U1", 10, 1), ("U2", 10, 2)],
+        )
+        self.assertTrue(result.usable)
+        self.assertEqual(
+            [(e.sink_id, e.delivered) for e in result.baseline.entries],
+            [("U1", 6), ("U2", 0)],
+        )
+        self.assertEqual(
+            [(e.sink_id, e.delivered) for e in result.bypass.entries],
+            [("U1", 10), ("U2", 0)],
+        )
+
+    def test_zero_capacity_bypass_matches_baseline(self):
+        nodes, pipes = build_allocation_demo()
+        result = evaluate_bypass(
+            nodes, pipes, "S", "A", 0,
+            [("S", 100)],
+            [("P1", 6), ("P2", 100), ("P3", 100)],
+            [("U1", 10, 1), ("U2", 10, 2)],
+        )
+        self.assertTrue(result.usable)
+        self.assertEqual(
+            [e.delivered for e in result.bypass.entries],
+            [e.delivered for e in result.baseline.entries],
+        )
+
+    def test_stopped_source_side_bypass_does_not_rewater(self):
+        # 停运水源一侧的旁通不构成重新进水（只从运行水源判断可达）
+        nodes = {
+            "S1": Node("S1", "source"),
+            "S2": Node("S2", "source", running=False),
+            "C": Node("C", "junction"),
+            "U1": Node("U1", "sink"),
+            "U2": Node("U2", "sink"),
+        }
+        pipes = {
+            "Q1": Pipe("Q1", "S1", "C", has_valve=True),
+            "Q2": Pipe("Q2", "C", "U1", has_valve=True),
+            # Q3 已关：S2 一侧与运行水源断开
+            "Q3": Pipe("Q3", "S2", "C", has_valve=True, valve_closed=True),
+            "Q4": Pipe("Q4", "S2", "U2", has_valve=False),  # 待修复故障
+        }
+        source_caps = [("S1", 100), ("S2", 100)]
+        pipe_caps = [("Q1", 100), ("Q2", 100), ("Q3", 100), ("Q4", 100)]
+        demands = [("U1", 10, 1), ("U2", 10, 1)]
+        blocked = frozenset({"Q3", "Q4"})
+        pending = frozenset({"Q4"})
+        # 旁通 S2—U2（与故障管段并联）：S2 停运，U2 仍不可从运行水源到达 -> 安全
+        result = evaluate_bypass(
+            nodes, pipes, "S2", "U2", 50, source_caps, pipe_caps, demands,
+            blocked_pipe_ids=blocked, pending_fault_pipe_ids=pending,
+        )
+        self.assertTrue(result.usable)
+        # 旁通 C—U2：U2 从运行水源 S1 可达 -> 故障端点重新进水，不可用
+        result = evaluate_bypass(
+            nodes, pipes, "C", "U2", 50, source_caps, pipe_caps, demands,
+            blocked_pipe_ids=blocked, pending_fault_pipe_ids=pending,
+        )
+        self.assertFalse(result.usable)
+        self.assertEqual(
+            [(b.fault_pipe_id, b.reachable_endpoints) for b in result.blocks],
+            [("Q4", ["U2"])],
+        )
+
+    def test_multiple_pending_faults_all_reported_sorted(self):
+        # 两条待修复故障共享连接点 X：旁通 J—X 使两条故障端点都重新进水
+        nodes = {
+            "S": Node("S", "source"),
+            "J": Node("J", "junction"),
+            "X": Node("X", "junction"),
+            "U1": Node("U1", "sink"),
+            "U2": Node("U2", "sink"),
+        }
+        pipes = {
+            "P1": Pipe("P1", "S", "J", has_valve=True),
+            "F1": Pipe("F1", "X", "U1", has_valve=False),
+            "F2": Pipe("F2", "X", "U2", has_valve=False),
+        }
+        result = evaluate_bypass(
+            nodes, pipes, "J", "X", 50,
+            [("S", 100)],
+            [("P1", 100), ("F1", 100), ("F2", 100)],
+            [("U1", 10, 1), ("U2", 10, 1)],
+            blocked_pipe_ids=frozenset({"F1", "F2"}),
+            pending_fault_pipe_ids=frozenset({"F1", "F2"}),
+        )
+        self.assertFalse(result.usable)
+        self.assertEqual(
+            [(b.fault_pipe_id, b.reachable_endpoints) for b in result.blocks],
+            [("F1", ["X"]), ("F2", ["X"])],
+        )
+
+    def test_inputs_not_mutated(self):
+        nodes, pipes, source_caps, pipe_caps, demands, blocked, pending = (
+            self._zone_args()
+        )
+        evaluate_bypass(
+            nodes, pipes, "B", "U4", 50, source_caps, pipe_caps, demands,
+            blocked_pipe_ids=blocked, pending_fault_pipe_ids=pending,
+        )
+        # 旁通只接入内存副本：调用方的管段与容量列表不被改写
+        self.assertEqual(sorted(pipes), [f"P{i}" for i in range(1, 9)])
+        self.assertEqual(len(pipe_caps), 8)
+
+    def test_validate_bypass_request_unknown_and_same_endpoints(self):
+        nodes, _pipes = build_allocation_demo()
+        # 两端相同
+        issues = validate_bypass_request(nodes, "A", "A")
+        self.assertEqual([i.code for i in issues], [BYPASS_ENDPOINT_SAME])
+        # 两个端点都不存在：各报一条
+        issues = validate_bypass_request(nodes, "XX", "YY")
+        self.assertEqual(
+            [i.code for i in issues],
+            [BYPASS_ENDPOINT_NOT_FOUND, BYPASS_ENDPOINT_NOT_FOUND],
+        )
+        # 一端不存在
+        issues = validate_bypass_request(nodes, "A", "XX")
+        self.assertEqual([i.code for i in issues], [BYPASS_ENDPOINT_NOT_FOUND])
+        # 与现有管段并联、任意节点类型作端点均合法
+        self.assertEqual(validate_bypass_request(nodes, "S", "A"), [])
+        self.assertEqual(validate_bypass_request(nodes, "U1", "U2"), [])
 
 
 # ---------------------------------------------------------------- 读数核对

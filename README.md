@@ -17,13 +17,18 @@
 供水不足时还可携带各用水点的**保障等级**（数字越小越优先），**只读核算分档交付**：
 先按等级依次最大化该等级交付总量，再在各等级总量最优条件下按（等级、用水点编号）
 逐点最大化交付量，返回各点交付与缺口，结果由一组同时可行的整数流量实现。
+抢修期间还可评估一条**临时旁通管**的供水效果（只读）：输入两个现有节点与旁通管
+双向共用容量（允许与现有管段并联），先按当前阀位、运行水源与待修复故障核算
+**基线**分档交付，再仅在内存中接入旁通——若接入后任一待修复故障管段的任一端
+从运行水源可达，判为**不可用**并返回故障编号与危险端点（不输出旁通交付量）；
+安全时返回基线与旁通后的各等级、各用水点交付量及差值。
 调度员在执行前还可把一串**有序的隔离、复供、水源切换操作**交给**调度演练**接口
 **只读预检**：以当前状态为起点逐步套用既有提交校验，复供可引用现存待修复事件或
 本次演练先前隔离产生的**临时事件**，逐步给出新增失供/恢复供水用水点与最终
 运行水源、阀位、待修复故障、通水用水点，首个非法或不安全步骤即标明原因并停止。
 
 > 全部通水计算（读网、关阀建议、隔离预演/提交、复供预演/确认、水源切换预演、
-> 流量核算、分档交付、调度演练）只以**运行中**的水源为供水起点；停运水源不再供水。
+> 流量核算、分档交付、临时旁通评估、调度演练）只以**运行中**的水源为供水起点；停运水源不再供水。
 
 ---
 
@@ -207,6 +212,34 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
   （每点 `sink_id/level/demand/delivered/shortfall/satisfied`）。
 - 过期版本**不拒绝**：仍按当前状态核算，仅 `version_match=false`。
 
+**临时旁通评估**（`POST /api/delivery/bypass`，**只读**，不改阀位/事件/版本/快照；
+与现有 `/api/delivery/evaluate`、`/api/delivery/allocate` 并存、互不影响）：
+
+- 抢修期间评估一条**临时旁通管**的供水效果。入参为已读 `version` +
+  `bypass`（`from`/`to` 为**两个现有节点**，`capacity` 为旁通管**双向共用容量**，
+  允许与现有管段并联）+ 覆盖当前管网全部水源/管段的容量 `sources`/`pipes` +
+  带**保障等级**的用水需求 `demands`（`sink_id/demand/level`，规则与
+  `/api/delivery/allocate` 完全一致）。
+- 评估顺序：先按**当前阀位、运行水源与待修复(open)故障**核算**基线**分档交付；
+  再**仅在内存中**把旁通管接入两个端点（旁通不写入管网、不产生任何状态变化）。
+- **安全判定**：接入旁通后，若任一**待修复故障管段**的任一端从**运行水源**可达
+  （重新进水风险，与复供/水源切换同口径），判为**不可用**：返回 `usable=false`
+  与 `block_reasons`（代码 `FAULT_REWATER_RISK`，含故障管段编号 `pipe_id` 与
+  危险端点 `reachable_endpoints`），**不输出旁通交付量**
+  （`with_bypass` 与 `delta` 均为 `null`）；基线结果仍正常返回。
+- **安全时**按现有分档交付规则返回：`baseline` 与 `with_bypass` 各含
+  `total_demand/total_delivered/all_satisfied/levels/deliveries`
+  （结构与分档交付一致），`delta` 给出旁通后相对基线的差值
+  （`total_delivered_delta`、按等级的 `levels[].delivered_delta`、
+  按用水点的 `deliveries[].delivered_delta`，均为旁通后 − 基线）。
+- **整体拒绝**（`422 BYPASS_REQUEST_INVALID`，返回全部问题明细）：旁通端点不存在
+  （`BYPASS_ENDPOINT_NOT_FOUND`）或两端相同（`BYPASS_ENDPOINT_SAME`），
+  以及水源/管段/用水点编号集合非法（与分档交付同一套 `DELIVERY_*` 问题代码）；
+  容量为布尔/小数/负数等按请求结构校验 `422` 拒绝。
+- 通水口径与分档交付一致：停运水源不供水、已关阀门与待修复故障管段不可通行、
+  管段（含旁通）双向共用容量；过期版本**不拒绝**，仍按当前状态核算，
+  仅 `version_match=false`。
+
 **读数核对**（`POST /api/meters/reconcile`，**只读**，不改阀位/水源状态/事件/版本/快照）：
 
 - 调度员核对一批管段流量计读数，并在表计**缺报**时判断其可推断范围。入参为已读
@@ -314,6 +347,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 | POST | `/api/sources/switch` | 水源停运/恢复确认（锁版本复核 + 原子更新水源状态） |
 | POST | `/api/delivery/evaluate` | 用水点最低流量核算（只读：现有阀位/故障下的最大可交付总量，整数最大流） |
 | POST | `/api/delivery/allocate` | 保障等级分档交付（只读：先按等级总量、再按等级/编号逐点最大化各点交付与缺口） |
+| POST | `/api/delivery/bypass` | 临时旁通评估（只读：内存接入旁通管，基线与旁通后各等级/各用水点交付及差值；重新进水风险判不可用） |
 | POST | `/api/meters/reconcile` | 管段流量计读数核对（只读：一致性校验 + 缺报管段可行流量最小/最大值，整数有界可行流） |
 | POST | `/api/drill` | 调度演练（只读：有序隔离/复供/水源切换逐步预检，临时事件引用，首个失败步骤即停） |
 | GET | `/api/snapshots` | 状态快照列表（编号升序，`limit` / `after_id` 游标分页） |
@@ -1002,7 +1036,150 @@ python3 examples/allocate_demo.py http://localhost:8000
 隔离关阀后故障片区断供 → 等级非正整数 / 编号未覆盖 / 重复 / 类型错误的 422 拒绝 →
 确认版本、阀位与事件全程未被改写。
 
-### 13. 管段流量计读数核对（只读，缺报推断）
+### 13. 临时旁通评估（只读，抢修期间供水效果）
+
+抢修期间，故障管段已隔离（事件待修复），调度员评估在两个现有节点之间
+临时铺设一条旁通管的供水效果。演示使用管网 `examples/bypass_network.json`
+（在分档交付演示管网基础上增加 `P7[阀]—E—P8[阀]—U4` 支线）：
+
+```
+S --P1[阀]-- A --P2[阀]-- B --P4[阀]-- D --P6(无阀,故障)-- U3
+               |           |            |
+             P3[阀]      P5[阀]       P7[阀]
+               |           |            |
+              U1          U2           E --P8[阀]-- U4
+```
+
+先导入并提交隔离（故障 P6，关 P4 与 P7：U3/U4 失供，版本变为 2）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/network/import \
+  -H 'Content-Type: application/json' -d @examples/bypass_network.json
+curl -s -X POST http://localhost:8000/api/isolation/submit \
+  -H 'Content-Type: application/json' \
+  -d '{"fault_pipe_id":"P6","close_pipe_ids":["P4","P7"],"version":1}'
+```
+
+评估旁通 `B—U4`（双向共用容量 50）：E/U4 区与故障端点 D/U3 被已关阀门
+P7 隔开，接入后故障端点仍不可达，`usable=true`——基线中 U4 交付 0，
+旁通后恢复 10，`delta` 给出各等级、各用水点差值（**只读**，不改任何状态）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/delivery/bypass \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": 2,
+    "bypass": {"from": "B", "to": "U4", "capacity": 50},
+    "sources": [{"source_id": "S", "capacity": 100}],
+    "pipes": [
+      {"pipe_id": "P1", "capacity": 100},
+      {"pipe_id": "P2", "capacity": 100},
+      {"pipe_id": "P3", "capacity": 100},
+      {"pipe_id": "P4", "capacity": 100},
+      {"pipe_id": "P5", "capacity": 100},
+      {"pipe_id": "P6", "capacity": 100},
+      {"pipe_id": "P7", "capacity": 100},
+      {"pipe_id": "P8", "capacity": 100}
+    ],
+    "demands": [
+      {"sink_id": "U1", "demand": 10, "level": 1},
+      {"sink_id": "U2", "demand": 10, "level": 1},
+      {"sink_id": "U3", "demand": 10, "level": 2},
+      {"sink_id": "U4", "demand": 10, "level": 2}
+    ]
+  }'
+```
+
+响应（节选：`baseline`/`with_bypass` 结构与分档交付一致，`delta` 为
+旁通后 − 基线）：
+
+```json
+{
+  "version": 2,
+  "version_match": true,
+  "bypass": {"from": "B", "to": "U4", "capacity": 50},
+  "usable": true,
+  "block_reasons": [],
+  "baseline": {"total_demand": 40, "total_delivered": 20, "all_satisfied": false,
+               "levels": ["..."], "deliveries": ["..."]},
+  "with_bypass": {"total_demand": 40, "total_delivered": 30, "all_satisfied": false,
+                  "levels": ["..."], "deliveries": ["..."]},
+  "delta": {
+    "total_delivered_delta": 10,
+    "levels": [
+      {"level": 1, "delivered_delta": 0},
+      {"level": 2, "delivered_delta": 10}
+    ],
+    "deliveries": [
+      {"sink_id": "U1", "level": 1, "delivered_delta": 0},
+      {"sink_id": "U2", "level": 1, "delivered_delta": 0},
+      {"sink_id": "U3", "level": 2, "delivered_delta": 0},
+      {"sink_id": "U4", "level": 2, "delivered_delta": 10}
+    ]
+  }
+}
+```
+
+危险旁通：若把旁通接到故障管段端点（如 `B—D`），接入后待修复故障管段
+P6 的 D 端将从运行水源重新进水——判为不可用，**不输出旁通交付量**
+（`with_bypass` 与 `delta` 均为 `null`），`block_reasons` 给出故障编号
+与危险端点；基线结果仍返回。请求体与上例相同，仅 `bypass` 改为
+`{"from": "B", "to": "D", "capacity": 50}`：
+
+```json
+{
+  "version": 2,
+  "version_match": true,
+  "bypass": {"from": "B", "to": "D", "capacity": 50},
+  "usable": false,
+  "block_reasons": [
+    {
+      "code": "FAULT_REWATER_RISK",
+      "message": "接入旁通后，待修复故障管段 P6 的 D 端将重新进水，旁通不可用",
+      "pipe_id": "P6",
+      "reachable_endpoints": ["D"]
+    }
+  ],
+  "baseline": {"total_demand": 40, "total_delivered": 20, "...": "..."},
+  "with_bypass": null,
+  "delta": null
+}
+```
+
+本轮用法要点：
+
+- `bypass.from` / `bypass.to` 必须是**两个不同的现有节点**（任意类型均可，
+  允许与现有管段并联——并联即与既有管段共同分担流量）；`capacity` 为
+  **非负整数**双向共用容量（升/小时）。旁通只在内存中接入评估，
+  **不写入管网**：版本、阀位、事件、快照均不变。
+- `sources` / `pipes` 仍须**逐一覆盖当前管网全部水源与管段**（停运水源、
+  关阀/故障管段也仍须列出，旁通管本身**不需**列入 `pipes`）；
+  `demands` 只列本次申报需求的用水点，规则与 `/api/delivery/allocate`
+  完全一致（`level` 为正整数，数字越小越优先）。
+- 安全判定只看**接入后**的可达性：任一待修复故障管段的任一端从
+  **运行水源**可达即 `usable=false`；旁通接在停运水源一侧、或接入后
+  该连通块没有运行水源（如与故障管段并联但无源）时仍判安全。
+- 端点不存在/相同、编号未覆盖/重复/类型错误等整体拒绝
+  `422 BYPASS_REQUEST_INVALID`（明细含 `BYPASS_*` 与 `DELIVERY_*` 问题代码）；
+  容量为布尔/小数/负数按请求结构校验 `422` 拒绝。
+- 用过期版本（如 `"version": 99`）调用不报错，仍按当前状态核算，
+  仅 `version_match=false`。
+
+临时旁通评估全流程演示脚本（标准库实现，全程只读）：
+
+```bash
+python3 examples/bypass_demo.py
+# 或指定地址：
+python3 examples/bypass_demo.py http://localhost:8000
+```
+
+脚本依次演示：导入 → 隔离故障 P6（关 P4/P7）→ 安全旁通 B—U4 恢复供水
+（基线/旁通后/差值）→ 并联旁通 S—A 提升 P1 瓶颈 → 危险旁通 B—D 判不可用
+（重新进水风险，不输出旁通交付量）→ 与故障管段并联但无源仍安全 →
+过期版本仍按当前状态核算 → 端点相同/不存在、容量非法、管段未覆盖的
+422 拒绝 → 确认版本、阀位与事件全程未被改写。
+
+### 14. 管段流量计读数核对（只读，缺报推断）
 
 调度员携带已读版本、每个水源的**实际注入量**、每个用水点的**实际取用量**、
 覆盖全部管段的**双向共用容量**与可为空的**带符号读数**（`from→to` 为正，升/小时），
@@ -1087,7 +1264,7 @@ python3 examples/meter_reconcile_demo.py http://localhost:8000
 编号未覆盖/重复/未知节点与类型错误的 422 拒绝 → 确认版本、阀位、水源状态与事件
 全程未被改写。
 
-### 14. 调度演练（只读：一串操作执行前的逐步预检）
+### 15. 调度演练（只读：一串操作执行前的逐步预检）
 
 调度员把一串**有序的隔离、复供、水源切换操作**连同已读版本一起提交演练；
 服务以当前状态为起点逐步套用既有提交校验，**全程只读**（不改版本、阀位、
@@ -1204,6 +1381,14 @@ python3 examples/source_switch_demo.py
 python3 examples/source_switch_demo.py http://localhost:8000
 ```
 
+临时旁通评估流程（隔离故障 → 安全旁通恢复供水与差值 → 并联旁通提升瓶颈 → 危险旁通判不可用 → 过期版本/非法请求 → 全程只读核对）：
+
+```bash
+python3 examples/bypass_demo.py
+# 或指定地址：
+python3 examples/bypass_demo.py http://localhost:8000
+```
+
 调度演练流程（五步连贯演练与最终状态 → 复供现存/临时事件 → 重新进水风险首败即停 → 过期版本 409 → 引用不存在事件 → 全程只读核对）：
 
 ```bash
@@ -1214,13 +1399,13 @@ python3 examples/drill_demo.py http://localhost:8000
 
 ## 七、测试
 
-核心图算法与校验逻辑（`tests/test_planning.py`，103 个用例）不依赖数据库与第三方库，可直接用标准库运行：
+核心图算法与校验逻辑（`tests/test_planning.py`，114 个用例）不依赖数据库与第三方库，可直接用标准库运行：
 
 ```bash
 python3 -m unittest tests.test_planning -v
 ```
 
-路由层集成测试（`tests/test_api.py`，103 个用例）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、流量只读核算、**保障等级分档交付（等级总量/逐点字典序/阻断口径/422/只读）**、读数核对（一致性/缺报范围/硬约束/422）、**调度演练（逐步预检/临时事件引用/首败即停/409/只读）**、版本与安全拒绝、整网替换失效、状态快照冻结/读取/相邻对照/失败不留痕/重导不覆盖），需先安装依赖：
+路由层集成测试（`tests/test_api.py`，113 个用例）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、流量只读核算、**保障等级分档交付（等级总量/逐点字典序/阻断口径/422/只读）**、**临时旁通评估（基线/旁通后交付与差值/重新进水判不可用/并联/422/只读）**、读数核对（一致性/缺报范围/硬约束/422）、**调度演练（逐步预检/临时事件引用/首败即停/409/只读）**、版本与安全拒绝、整网替换失效、状态快照冻结/读取/相邻对照/失败不留痕/重导不覆盖），需先安装依赖：
 
 ```bash
 pip install -r requirements.txt httpx
@@ -1233,7 +1418,7 @@ python3 -m unittest discover -s tests -v
 app/
   config.py       # 环境变量配置
   schemas.py      # Pydantic 请求/响应模型
-  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS，仅运行水源)、隔离评估、复供安全评估、关阀建议、水源切换评估、流量核算(校验+整数无向最大流)、保障等级分档交付(有下界整数环流+残量环流补偿的字典序最大流)、读数核对(校验+整数有界可行流+缺报流量范围)、调度演练(状态副本上逐步套用提交校验的只读推演)、状态快照冻结与相邻对照
+  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS，仅运行水源)、隔离评估、复供安全评估、关阀建议、水源切换评估、流量核算(校验+整数无向最大流)、保障等级分档交付(有下界整数环流+残量环流补偿的字典序最大流)、临时旁通评估(内存接入旁通+重新进水检查+基线/旁通后分档交付)、读数核对(校验+整数有界可行流+缺报流量范围)、调度演练(状态副本上逐步套用提交校验的只读推演)、状态快照冻结与相邻对照
   db.py           # PostgreSQL：DDL/迁移、快照、整网导入、事务化隔离提交、事务化复供、事务化水源切换、状态快照写入/读取、旧库上线基线、历史
   serializers.py  # 响应序列化
   main.py         # FastAPI 路由与错误处理
@@ -1241,12 +1426,14 @@ examples/
   sample_network.json     # 隔离演示管网
   restore_network.json    # 复供演示管网（叠加故障）
   sources_network.json    # 水源调度演示管网（双水源联网）
+  bypass_network.json     # 临时旁通评估演示管网（故障隔离区外可安全接入旁通）
   demo.py                 # 隔离全流程示例
   restore_demo.py         # 复供全流程示例
   recommend_demo.py       # 关阀建议全流程示例
   source_switch_demo.py   # 水源停运/恢复全流程示例
   delivery_demo.py        # 用水点最低流量核算全流程示例（只读：水源/管段上限、瓶颈、停运/关阀阻断）
   allocate_demo.py        # 保障等级分档交付全流程示例（只读：等级总量优先、同等级编号序、缺口、阻断口径、422）
+  bypass_demo.py          # 临时旁通评估全流程示例（只读：基线/旁通后交付与差值、重新进水判不可用、并联、422）
   meter_reconcile_demo.py # 管段流量计读数核对全流程示例（只读：一致性、缺报范围、停运/关阀/故障硬约束、422）
   drill_demo.py           # 调度演练全流程示例（只读：有序步骤逐步预检、临时事件引用、首败即停、409/只读核对）
   snapshot_demo.py        # 状态快照回看全流程示例（四类操作冻结/读取/对照/不留痕/重导不覆盖）

@@ -14,6 +14,7 @@
 - POST /api/sources/switch                             水源停运/恢复确认（单事务复核 + 原子改状态）
 - POST /api/delivery/evaluate                          用水点最低流量核算（只读：现有阀位/故障下最大可交付总量）
 - POST /api/delivery/allocate                          保障等级分档交付核算（只读：按等级总量、再逐点字典序最大化交付）
+- POST /api/delivery/bypass                            临时旁通评估（只读：内存接入旁通管，基线与旁通后分档交付及差值）
 - POST /api/meters/reconcile                           管段流量计读数核对（只读：一致性 + 缺报读数可行流量范围）
 - POST /api/drill                                      调度演练（只读：按顺序演练一串隔离/复供/水源切换，逐步套用提交校验）
 
@@ -35,12 +36,14 @@ from .planning import (
     DrillStep,
     diff_states,
     allocate_delivery,
+    evaluate_bypass,
     evaluate_delivery,
     evaluate_plan,
     evaluate_restore,
     evaluate_source_switch,
     recommend_plan,
     simulate_drill,
+    validate_bypass_request,
     validate_delivery_request,
     validate_reconcile_request,
     reconcile_meters,
@@ -58,6 +61,7 @@ from .schemas import (
     SourceSwitchIn,
     DeliveryEvaluateIn,
     DeliveryAllocateIn,
+    DeliveryBypassIn,
     MeterReconcileIn,
     DrillIn,
     DrillIsolationStepIn,
@@ -73,6 +77,7 @@ from .schemas import (
     SourceSwitchOut,
     DeliveryEvaluateOut,
     DeliveryAllocateOut,
+    DeliveryBypassOut,
     MeterReconcileOut,
     DrillOut,
     EventOut,
@@ -87,6 +92,7 @@ from .serializers import (
     serialize_source_switch_preview,
     serialize_delivery,
     serialize_allocation,
+    serialize_bypass,
     serialize_reconcile,
     serialize_drill,
     serialize_snapshot,
@@ -112,7 +118,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="供水管网故障隔离服务",
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -592,6 +598,58 @@ def allocate_delivery_request(payload: DeliveryAllocateIn):
         blocked_pipe_ids=blocked_pipe_ids,
     )
     return serialize_allocation(version, payload.version, result)
+
+
+@app.post(
+    "/api/delivery/bypass",
+    response_model=DeliveryBypassOut,
+    tags=["流量核算"],
+    summary="临时旁通评估：内存接入旁通管，核算基线与旁通后的分档交付及差值（只读）",
+)
+def evaluate_bypass_request(payload: DeliveryBypassIn):
+    with db.get_conn() as conn:
+        version, _updated_at, nodes, pipes = db.load_snapshot(conn)
+        # 已关闭阀门与待修复故障管段不可通行：阻断口径与既有可达性接口完全一致
+        pending_fault_ids = frozenset(
+            e["fault_pipe_id"] for e in db.list_open_events(conn)
+        )
+
+    source_caps = [(s.source_id, s.capacity) for s in payload.sources]
+    pipe_caps = [(p.pipe_id, p.capacity) for p in payload.pipes]
+    demands = [(d.sink_id, d.demand) for d in payload.demands]
+    graded_demands = [(d.sink_id, d.demand, d.level) for d in payload.demands]
+
+    # 旁通端点校验 + 与分档交付完全一致的编号/覆盖/重复/类型校验，任一非法整体拒绝
+    issues = validate_bypass_request(
+        nodes, payload.bypass.from_node, payload.bypass.to_node
+    )
+    issues += validate_delivery_request(nodes, pipes, source_caps, pipe_caps, demands)
+    if issues:
+        raise ApiError(
+            422,
+            "BYPASS_REQUEST_INVALID",
+            "临时旁通评估请求非法（旁通端点不存在或相同、编号未覆盖当前管网、"
+            "同类重复、用水点不存在、类型错误或需求列表为空）",
+            issues=issues,
+        )
+
+    blocked_pipe_ids = frozenset(
+        p.id for p in pipes.values() if p.has_valve and p.valve_closed
+    ) | pending_fault_ids
+
+    result = evaluate_bypass(
+        nodes,
+        pipes,
+        payload.bypass.from_node,
+        payload.bypass.to_node,
+        payload.bypass.capacity,
+        source_caps,
+        pipe_caps,
+        graded_demands,
+        blocked_pipe_ids=blocked_pipe_ids,
+        pending_fault_pipe_ids=pending_fault_ids,
+    )
+    return serialize_bypass(version, payload.version, payload.bypass, result)
 
 
 # ---------------------------------------------------------------- 读数核对（只读）

@@ -2064,6 +2064,293 @@ class DeliveryAllocateApiTests(unittest.TestCase):
         )
 
 
+# 临时旁通评估演示管网（故障 P6 待修复；关 P4/P7 后 E/U4 区与故障端点被阀门隔开）：
+# S --P1[阀]-- A --P2[阀]-- B --P4[阀]-- D --P6(无阀,故障)-- U3
+#                |           |            |
+#              P3[阀]      P5[阀]       P7[阀]
+#                |           |            |
+#               U1          U2           E --P8[阀]-- U4
+BYPASS_NETWORK = {
+    "nodes": [
+        {"id": "S", "type": "source"},
+        {"id": "A", "type": "junction"},
+        {"id": "B", "type": "junction"},
+        {"id": "D", "type": "junction"},
+        {"id": "E", "type": "junction"},
+        {"id": "U1", "type": "sink"},
+        {"id": "U2", "type": "sink"},
+        {"id": "U3", "type": "sink"},
+        {"id": "U4", "type": "sink"},
+    ],
+    "pipes": [
+        {"id": "P1", "from": "S", "to": "A", "has_valve": True},
+        {"id": "P2", "from": "A", "to": "B", "has_valve": True},
+        {"id": "P3", "from": "A", "to": "U1", "has_valve": True},
+        {"id": "P4", "from": "B", "to": "D", "has_valve": True},
+        {"id": "P5", "from": "B", "to": "U2", "has_valve": True},
+        {"id": "P6", "from": "D", "to": "U3", "has_valve": False},
+        {"id": "P7", "from": "D", "to": "E", "has_valve": True},
+        {"id": "P8", "from": "E", "to": "U4", "has_valve": True},
+    ],
+}
+
+
+def _bypass_body(version=1, *, bypass=None, source_cap=100, pipe_caps=None, demands=None):
+    return {
+        "version": version,
+        "bypass": bypass or {"from": "B", "to": "U4", "capacity": 50},
+        "sources": [{"source_id": "S", "capacity": source_cap}],
+        "pipes": [
+            {"pipe_id": pid, "capacity": cap}
+            for pid, cap in (
+                pipe_caps
+                or [("P1", 100), ("P2", 100), ("P3", 100), ("P4", 100),
+                    ("P5", 100), ("P6", 100), ("P7", 100), ("P8", 100)]
+            )
+        ],
+        "demands": [
+            {"sink_id": sid, "demand": d, "level": lvl}
+            for sid, d, lvl in (
+                demands
+                or [("U1", 10, 1), ("U2", 10, 1), ("U3", 10, 2), ("U4", 10, 2)]
+            )
+        ],
+    }
+
+
+class DeliveryBypassApiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+
+    def setUp(self):
+        STORE.version = 0
+        STORE.nodes = {}
+        STORE.pipes = {}
+        STORE.events = []
+        STORE.next_event_id = 1
+        STORE.snapshots = []
+        STORE.next_snapshot_id = 1
+        STORE.fail_commit = False
+
+    def _import(self, network=BYPASS_NETWORK):
+        r = self.client.post("/api/network/import", json=network)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def _isolate_p6(self):
+        # 故障 P6（D—U3）：关 P4 与 P7 隔离，U3/U4 失供，版本 -> 2
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4", "P7"], "version": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["version"], 2)
+
+    def test_safe_bypass_returns_baseline_bypass_and_delta(self):
+        self._import()
+        self._isolate_p6()
+        r = self.client.post("/api/delivery/bypass", json=_bypass_body(version=2))
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertEqual(out["version"], 2)
+        self.assertTrue(out["version_match"])
+        self.assertEqual(out["bypass"], {"from": "B", "to": "U4", "capacity": 50})
+        self.assertTrue(out["usable"])
+        self.assertEqual(out["block_reasons"], [])
+        # 基线：U3/U4 在隔离区内断供
+        self.assertEqual(
+            [(d["sink_id"], d["delivered"]) for d in out["baseline"]["deliveries"]],
+            [("U1", 10), ("U2", 10), ("U3", 0), ("U4", 0)],
+        )
+        self.assertEqual(out["baseline"]["total_delivered"], 20)
+        self.assertFalse(out["baseline"]["all_satisfied"])
+        # 旁通后：U4 恢复 10，U3 仍断供
+        self.assertEqual(
+            [(d["sink_id"], d["delivered"]) for d in out["with_bypass"]["deliveries"]],
+            [("U1", 10), ("U2", 10), ("U3", 0), ("U4", 10)],
+        )
+        self.assertEqual(out["with_bypass"]["total_delivered"], 30)
+        # 差值：总量 +10、等级 2 +10、U4 +10，其余为 0
+        self.assertEqual(out["delta"]["total_delivered_delta"], 10)
+        self.assertEqual(
+            [(l["level"], l["delivered_delta"]) for l in out["delta"]["levels"]],
+            [(1, 0), (2, 10)],
+        )
+        self.assertEqual(
+            [(d["sink_id"], d["delivered_delta"]) for d in out["delta"]["deliveries"]],
+            [("U1", 0), ("U2", 0), ("U3", 0), ("U4", 10)],
+        )
+
+    def test_unsafe_bypass_returns_blocks_without_bypass_delivery(self):
+        self._import()
+        self._isolate_p6()
+        # 旁通接到故障管段端点 D：D 重新进水 -> 不可用，不输出旁通交付量
+        body = _bypass_body(version=2, bypass={"from": "B", "to": "D", "capacity": 50})
+        r = self.client.post("/api/delivery/bypass", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertFalse(out["usable"])
+        self.assertIsNone(out["with_bypass"])
+        self.assertIsNone(out["delta"])
+        self.assertEqual(len(out["block_reasons"]), 1)
+        block = out["block_reasons"][0]
+        self.assertEqual(block["code"], "FAULT_REWATER_RISK")
+        self.assertEqual(block["pipe_id"], "P6")
+        self.assertEqual(block["reachable_endpoints"], ["D"])
+        # 基线仍给出
+        self.assertEqual(out["baseline"]["total_delivered"], 20)
+
+        # 旁通接到故障管段另一端 U3 同样不可用
+        body = _bypass_body(version=2, bypass={"from": "B", "to": "U3", "capacity": 50})
+        out = self.client.post("/api/delivery/bypass", json=body).json()
+        self.assertFalse(out["usable"])
+        self.assertEqual(out["block_reasons"][0]["reachable_endpoints"], ["U3"])
+        self.assertIsNone(out["with_bypass"])
+
+    def test_bypass_parallel_to_fault_pipe_is_safe_but_helps_nothing(self):
+        self._import()
+        self._isolate_p6()
+        # 旁通与故障管段 P6 并联（D—U3）：该连通块无运行水源，安全但无提升
+        body = _bypass_body(version=2, bypass={"from": "D", "to": "U3", "capacity": 50})
+        out = self.client.post("/api/delivery/bypass", json=body).json()
+        self.assertTrue(out["usable"])
+        self.assertEqual(out["delta"]["total_delivered_delta"], 0)
+        self.assertEqual(
+            [d["delivered"] for d in out["with_bypass"]["deliveries"]],
+            [d["delivered"] for d in out["baseline"]["deliveries"]],
+        )
+
+    def test_parallel_bypass_boosts_bottleneck_without_faults(self):
+        self._import()
+        # 无待修复故障：旁通 S—A 与 P1（容量 6）并联，等级 1 的 U1 先拿满
+        body = _bypass_body(
+            bypass={"from": "S", "to": "A", "capacity": 4},
+            pipe_caps=[("P1", 6), ("P2", 100), ("P3", 100), ("P4", 100),
+                       ("P5", 100), ("P6", 100), ("P7", 100), ("P8", 100)],
+        )
+        out = self.client.post("/api/delivery/bypass", json=body).json()
+        self.assertTrue(out["usable"])
+        self.assertEqual(out["baseline"]["total_delivered"], 6)
+        self.assertEqual(out["with_bypass"]["total_delivered"], 10)
+        self.assertEqual(out["delta"]["total_delivered_delta"], 4)
+        u1 = next(d for d in out["delta"]["deliveries"] if d["sink_id"] == "U1")
+        self.assertEqual(u1["delivered_delta"], 4)
+
+    def test_stale_version_still_evaluated_with_mismatch_flag(self):
+        self._import()
+        self._isolate_p6()
+        out = self.client.post(
+            "/api/delivery/bypass", json=_bypass_body(version=99)
+        ).json()
+        self.assertEqual(out["version"], 2)
+        self.assertFalse(out["version_match"])
+        self.assertTrue(out["usable"])
+        self.assertEqual(out["with_bypass"]["total_delivered"], 30)
+
+    def test_invalid_bypass_endpoints_rejected(self):
+        self._import()
+        # 两端相同
+        body = _bypass_body(bypass={"from": "B", "to": "B", "capacity": 50})
+        r = self.client.post("/api/delivery/bypass", json=body)
+        self.assertEqual(r.status_code, 422)
+        err = r.json()["error"]
+        self.assertEqual(err["code"], "BYPASS_REQUEST_INVALID")
+        self.assertIn("BYPASS_ENDPOINT_SAME", {i["code"] for i in err["issues"]})
+        # 端点不存在 + 水源未覆盖：两类问题同批返回
+        body = _bypass_body(bypass={"from": "XX", "to": "YY", "capacity": 50})
+        body["sources"] = []
+        r = self.client.post("/api/delivery/bypass", json=body)
+        self.assertEqual(r.status_code, 422)
+        codes = {i["code"] for i in r.json()["error"]["issues"]}
+        self.assertIn("BYPASS_ENDPOINT_NOT_FOUND", codes)
+        self.assertIn("DELIVERY_SOURCE_MISSING", codes)
+
+    def test_empty_network_bypass_rejected(self):
+        # 空网：旁通端点不存在，整体拒绝
+        body = _bypass_body()
+        body["sources"] = []
+        body["pipes"] = []
+        r = self.client.post("/api/delivery/bypass", json=body)
+        self.assertEqual(r.status_code, 422)
+        codes = {i["code"] for i in r.json()["error"]["issues"]}
+        self.assertIn("BYPASS_ENDPOINT_NOT_FOUND", codes)
+
+    def test_delivery_request_invalid_rejected(self):
+        self._import()
+        # 管段未覆盖
+        body = _bypass_body()
+        body["pipes"] = body["pipes"][:-1]  # 缺 P8
+        r = self.client.post("/api/delivery/bypass", json=body)
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "BYPASS_REQUEST_INVALID")
+        self.assertIn(
+            "DELIVERY_PIPE_MISSING",
+            {i["code"] for i in r.json()["error"]["issues"]},
+        )
+        # 需求列表为空
+        body = _bypass_body()
+        body["demands"] = []
+        r = self.client.post("/api/delivery/bypass", json=body)
+        self.assertEqual(r.status_code, 422)
+        self.assertIn(
+            "DELIVERY_DEMANDS_EMPTY",
+            {i["code"] for i in r.json()["error"]["issues"]},
+        )
+
+    def test_invalid_capacity_and_structure_rejected(self):
+        self._import()
+
+        def post_raw(raw):
+            return self.client.post(
+                "/api/delivery/bypass",
+                content=json.dumps(raw),
+                headers={"Content-Type": "application/json"},
+            )
+
+        base = _bypass_body()
+        # 容量为负数 / 小数 / 布尔 / 字符串均非法
+        for bad_capacity in (-1, 1.5, True, "50"):
+            bad = json.loads(json.dumps(base))
+            bad["bypass"]["capacity"] = bad_capacity
+            self.assertEqual(post_raw(bad).status_code, 422, bad_capacity)
+        # 旁通缺端点 / 多余字段 / 整体缺 bypass
+        bad = json.loads(json.dumps(base))
+        del bad["bypass"]["to"]
+        self.assertEqual(post_raw(bad).status_code, 422)
+        bad = json.loads(json.dumps(base))
+        bad["bypass"]["extra"] = 1
+        self.assertEqual(post_raw(bad).status_code, 422)
+        bad = json.loads(json.dumps(base))
+        del bad["bypass"]
+        self.assertEqual(post_raw(bad).status_code, 422)
+
+    def test_read_only_no_state_change(self):
+        self._import()
+        self._isolate_p6()
+        # 安全评估 + 危险评估 + 过期版本 + 非法请求均不落任何状态
+        self.client.post("/api/delivery/bypass", json=_bypass_body(version=2))
+        self.client.post(
+            "/api/delivery/bypass",
+            json=_bypass_body(version=2, bypass={"from": "B", "to": "D", "capacity": 50}),
+        )
+        self.client.post("/api/delivery/bypass", json=_bypass_body(version=99))
+        bad = _bypass_body(version=2)
+        bad["sources"] = []
+        self.client.post("/api/delivery/bypass", json=bad)
+        net = self.client.get("/api/network").json()
+        self.assertEqual(net["version"], 2)
+        valves = {p["id"]: p["valve_closed"] for p in net["pipes"]}
+        self.assertTrue(valves["P4"])
+        self.assertTrue(valves["P7"])
+        events = self.client.get("/api/isolation/events").json()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["status"], "open")
+        # 只产生导入与隔离两条快照，评估不留痕
+        snaps = self.client.get("/api/snapshots").json()
+        self.assertEqual([s["id"] for s in snaps], [1, 2])
+
+
 def _reconcile_body(
     version=1,
     *,

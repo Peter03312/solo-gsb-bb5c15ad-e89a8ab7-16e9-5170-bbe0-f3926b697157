@@ -77,6 +77,18 @@
 - 每步的新增失供/恢复供水用水点均相对上一步结束状态计算。
 - 任一步非法或不安全即停止：记录首个失败步骤与原因，后续步骤不再演练；
   全部成功才汇总最终运行水源、阀位、待修复故障与通水用水点。
+
+临时旁通管评估（bypass）规则（只读，不改阀位/事件/版本/快照）：
+- 抢修期间调度员携带已读版本、两个现有节点（旁通端点）、旁通管双向共用容量、
+  覆盖当前管网的水源/管段容量与带保障等级的用水需求，评估一条临时旁通管的
+  供水效果；旁通允许与现有管段并联，且只在内存副本中接入，绝不写入管网。
+- 先按当前阀位、运行水源与待修复故障核算基线分档交付；再在内存副本中接入
+  旁通管：若接入后任一待修复故障管段的任一端从运行水源可达（重新进水风险，
+  与复供/水源切换同口径的拓扑判定，与旁通容量大小无关），判为不可用，
+  返回故障编号与危险端点，不输出旁通交付量。
+- 安全时按与分档交付完全一致的规则分别核算基线与接入旁通后的各等级、
+  各用水点交付量并给出差值；版本过期仍按当前状态核算，仅标记
+  version_match=false；端点不存在或相同、容量或编号集合非法时整体拒绝。
 """
 from __future__ import annotations
 
@@ -120,6 +132,10 @@ DELIVERY_SINK_NOT_FOUND = "DELIVERY_SINK_NOT_FOUND"  # 用水点编号不存在
 DELIVERY_SINK_NOT_SINK = "DELIVERY_SINK_NOT_SINK"  # 节点存在但不是用水点
 DELIVERY_SINK_DUPLICATE = "DELIVERY_SINK_DUPLICATE"  # 用水点编号重复
 DELIVERY_DEMANDS_EMPTY = "DELIVERY_DEMANDS_EMPTY"  # 用水点需求列表为空
+
+# 临时旁通评估请求问题（结构 / 端点 -> 422 整体拒绝）
+BYPASS_ENDPOINT_NOT_FOUND = "BYPASS_ENDPOINT_NOT_FOUND"  # 旁通端点在当前管网不存在
+BYPASS_ENDPOINT_SAME = "BYPASS_ENDPOINT_SAME"  # 旁通两端为同一节点（自环）
 
 # 读数核对请求问题（结构 / 编号 / 覆盖 / 重复 -> 422 整体拒绝）
 RECONCILE_SOURCE_NOT_FOUND = "RECONCILE_SOURCE_NOT_FOUND"
@@ -1350,6 +1366,162 @@ def allocate_delivery(
         all_satisfied=total_delivered == total_demand,
         entries=entries,
         levels=level_summaries,
+    )
+
+
+# ---------------------------------------------------- 临时旁通管评估
+
+
+@dataclass
+class BypassBlock:
+    """旁通安全风险：接入旁通后某条待修复故障管段有一端将从运行水源重新进水。"""
+
+    fault_pipe_id: str
+    reachable_endpoints: list[str]
+
+    def as_dict(self) -> dict:
+        return {
+            "code": FAULT_REWATER_RISK,
+            "message": (
+                f"接入旁通后，待修复故障管段 {self.fault_pipe_id} 的 "
+                f"{ '、'.join(self.reachable_endpoints) } 端将重新进水，旁通不可用"
+            ),
+            "pipe_id": self.fault_pipe_id,
+            "reachable_endpoints": list(self.reachable_endpoints),
+        }
+
+
+@dataclass
+class BypassEvaluationResult:
+    """临时旁通管供水效果评估结果（只读计算，不改任何状态）。
+
+    - baseline：未接入旁通时按现有分档交付规则的基线结果（无论安全与否恒给出）；
+    - bypass：接入旁通后的分档交付结果；存在重新进水风险时为 None
+      （判为不可用，不输出旁通交付量）；
+    - blocks：每条待修复故障管段在接入旁通后的重新进水风险（任一端从运行
+      水源可达即列入）；存在风险时 safe=False。
+    """
+
+    baseline: AllocationResult
+    bypass: AllocationResult | None
+    safe: bool
+    blocks: list[BypassBlock] = field(default_factory=list)
+
+
+def validate_bypass_request(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe],
+    from_node: str,
+    to_node: str,
+    source_caps: list[tuple[str, int]],
+    pipe_caps: list[tuple[str, int]],
+    demands: list[tuple[str, int]],
+) -> list[Issue]:
+    """校验临时旁通评估请求本身（结构 / 编号 / 覆盖 / 重复 / 旁通端点）。
+
+    水源、管段、用水点编号规则与 validate_delivery_request 完全一致；
+    旁通端点必须是当前管网中两个不同的现有节点（允许与现有管段并联，
+    端点类型不限）。旁通容量的非负整数约束由请求模型（pydantic）保证。
+    """
+    issues = validate_delivery_request(nodes, pipes, source_caps, pipe_caps, demands)
+
+    if from_node == to_node:
+        issues.append(
+            Issue(
+                BYPASS_ENDPOINT_SAME,
+                f"旁通管两端不能是同一节点：{from_node}",
+                from_node,
+            )
+        )
+    seen: set[str] = set()
+    for endpoint in (from_node, to_node):
+        if endpoint in seen:
+            continue
+        seen.add(endpoint)
+        if endpoint not in nodes:
+            issues.append(
+                Issue(
+                    BYPASS_ENDPOINT_NOT_FOUND,
+                    f"旁通端点在当前管网不存在：{endpoint}",
+                    endpoint,
+                )
+            )
+    return issues
+
+
+def evaluate_bypass(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe],
+    from_node: str,
+    to_node: str,
+    bypass_capacity: int,
+    source_caps: list[tuple[str, int]],
+    pipe_caps: list[tuple[str, int]],
+    demands: list[tuple[str, int, int]],
+    *,
+    blocked_pipe_ids: frozenset[str] = frozenset(),
+    pending_fault_pipe_ids: frozenset[str] = frozenset(),
+) -> BypassEvaluationResult:
+    """评估一条临时旁通管的供水效果（只读，不改任何状态）。
+
+    - from_node / to_node：旁通两端（须已过 validate_bypass_request 校验，
+      允许与现有管段并联）；bypass_capacity：旁通管双向共用容量；
+    - demands：(用水点编号, 非负整数需求, 正整数等级)，与 allocate_delivery 一致；
+    - blocked_pipe_ids：已关闭阀门与待修复故障管段（容量按 0，不可通行）；
+    - pending_fault_pipe_ids：待修复故障管段，用于接入旁通后的重新进水判定。
+
+    先按当前状态核算基线分档交付；再仅在内存副本中接入旁通管（生成一个
+    不与现有管段重号的虚拟编号，输入的 nodes/pipes 不被修改）：
+    接入后任一待修复故障管段的任一端从运行水源可达即判不可用
+    （拓扑可达判定，与复供/水源切换同口径，与旁通容量大小无关），
+    不核算旁通交付量；否则按同一分档规则核算接入后的交付。
+    """
+    baseline = allocate_delivery(
+        nodes,
+        pipes,
+        source_caps,
+        pipe_caps,
+        demands,
+        blocked_pipe_ids=blocked_pipe_ids,
+    )
+
+    # 内存副本中接入旁通：虚拟编号避开现有管段（允许与现有管段并联）
+    virtual_id = "__BYPASS__"
+    while virtual_id in pipes:
+        virtual_id = "_" + virtual_id
+    bypass_pipes = dict(pipes)
+    bypass_pipes[virtual_id] = Pipe(virtual_id, from_node, to_node)
+
+    # 安全判定：接入旁通后，待修复故障管段任一端从运行水源可达即重新进水
+    pending_faults = frozenset(pid for pid in pending_fault_pipe_ids if pid in pipes)
+    after_reachable = _reachable(nodes, list(bypass_pipes.values()), blocked_pipe_ids)
+    blocks: list[BypassBlock] = []
+    for fid in sorted(pending_faults):
+        fault = pipes[fid]
+        reachable_ends = [
+            end
+            for end in (fault.from_node, fault.to_node)
+            if end in after_reachable
+        ]
+        if reachable_ends:
+            blocks.append(
+                BypassBlock(fault_pipe_id=fid, reachable_endpoints=reachable_ends)
+            )
+    if blocks:
+        return BypassEvaluationResult(
+            baseline=baseline, bypass=None, safe=False, blocks=blocks
+        )
+
+    bypass_result = allocate_delivery(
+        nodes,
+        bypass_pipes,
+        source_caps,
+        list(pipe_caps) + [(virtual_id, bypass_capacity)],
+        demands,
+        blocked_pipe_ids=blocked_pipe_ids,
+    )
+    return BypassEvaluationResult(
+        baseline=baseline, bypass=bypass_result, safe=True, blocks=[]
     )
 
 

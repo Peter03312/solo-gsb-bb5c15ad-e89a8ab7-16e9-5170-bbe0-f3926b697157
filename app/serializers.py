@@ -8,6 +8,7 @@ from .planning import (
     SourceSwitchResult,
     DeliveryResult,
     AllocationResult,
+    BypassEvaluationResult,
     ReconcileResult,
     DrillResult,
     DrillStepOutcome,
@@ -126,14 +127,9 @@ def serialize_delivery(
     }
 
 
-def serialize_allocation(
-    version: int,
-    expected_version: int,
-    result: AllocationResult,
-) -> dict:
+def _allocation_body(result: AllocationResult) -> dict:
+    """分档交付结果的公共部分（总量 / 各等级 / 各用水点），不含版本字段。"""
     return {
-        "version": version,
-        "version_match": version == expected_version,
         "total_demand": result.total_demand,
         "total_delivered": result.total_delivered,
         "all_satisfied": result.all_satisfied,
@@ -158,6 +154,75 @@ def serialize_allocation(
             }
             for item in result.entries
         ],
+    }
+
+
+def serialize_allocation(
+    version: int,
+    expected_version: int,
+    result: AllocationResult,
+) -> dict:
+    return {
+        "version": version,
+        "version_match": version == expected_version,
+        **_allocation_body(result),
+    }
+
+
+def serialize_bypass(
+    version: int,
+    expected_version: int,
+    from_node: str,
+    to_node: str,
+    capacity: int,
+    result: BypassEvaluationResult,
+) -> dict:
+    """临时旁通评估结果：基线恒给出；不安全时旁通交付量与差值均为 null。"""
+    with_bypass = None
+    deltas = None
+    if result.bypass is not None:
+        baseline, bypassed = result.baseline, result.bypass
+        with_bypass = _allocation_body(bypassed)
+        base_levels = {item.level: item for item in baseline.levels}
+        bypass_levels = {item.level: item for item in bypassed.levels}
+        base_entries = {item.sink_id: item for item in baseline.entries}
+        deltas = {
+            "total_delivered_delta": (
+                bypassed.total_delivered - baseline.total_delivered
+            ),
+            "levels": [
+                {
+                    "level": lvl,
+                    "baseline_delivered": base_levels[lvl].delivered,
+                    "bypass_delivered": bypass_levels[lvl].delivered,
+                    "delivered_delta": (
+                        bypass_levels[lvl].delivered - base_levels[lvl].delivered
+                    ),
+                }
+                for lvl in sorted(bypass_levels)
+            ],
+            "deliveries": [
+                {
+                    "sink_id": item.sink_id,
+                    "level": item.level,
+                    "baseline_delivered": base_entries[item.sink_id].delivered,
+                    "bypass_delivered": item.delivered,
+                    "delivered_delta": (
+                        item.delivered - base_entries[item.sink_id].delivered
+                    ),
+                }
+                for item in bypassed.entries
+            ],
+        }
+    return {
+        "version": version,
+        "version_match": version == expected_version,
+        "bypass": {"from_": from_node, "to_": to_node, "capacity": capacity},
+        "safe": result.safe,
+        "block_reasons": [b.as_dict() for b in result.blocks],
+        "baseline": _allocation_body(result.baseline),
+        "with_bypass": with_bypass,
+        "deltas": deltas,
     }
 
 
